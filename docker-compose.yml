@@ -1,0 +1,28 @@
+version: '3.8'
+services:
+	mongodb:
+		image: mongo:6.0
+		container_name: raw_zone_mongo
+		ports:
+			- "27017:27017"
+		environment:
+			MONGO_INITDB_ROOT_USERNAME: admin
+			MONGO_INITDB_ROOT_PASSWORD: password123
+		volumes:
+			- mongo_data:/data/db
+
+	postgresql:
+		image: postgres:15
+		container_name: gold_zone_postgres
+		ports:
+			- "5432:5432"
+		environment:
+			POSTGRES_USER: admin
+			POSTGRES_PASSWORD: password123
+			POSTGRES_DB: salary_valuation
+		volumes:
+			- pg_data:/var/lib/postgresql/data
+
+volumes:
+	mongo_data:
+	pg_data:
