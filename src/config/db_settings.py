@@ -6,9 +6,12 @@ from pymongo import MongoClient
 load_dotenv()
 
 # Tat ca ket noi duoc doc tu bien moi truong de tranh hard-code thong tin nhay cam.
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-RAW_DB_NAME = os.getenv("RAW_DB_NAME", "jobs")
+MONGO_URI = os.getenv("MONGO_URI")
+RAW_DB_NAME = os.getenv("RAW_DB_NAME", "recruitment_datalake")
 RAW_COLLECTION_NAME = os.getenv("RAW_COLLECTION_NAME", "raw_jobs")
+
+if not MONGO_URI:
+    raise RuntimeError("Thieu bien moi truong MONGO_URI. Hay cap nhat file .env truoc khi chay.")
 
 
 def get_mongo_client() -> MongoClient:
