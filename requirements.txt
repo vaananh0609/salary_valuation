@@ -9,9 +9,12 @@ python-dotenv==1.0.1
 # Xu ly va lam sach du lieu (Data Processing)
 pandas>=3.0.0
 scikit-learn>=1.5.0
-sentence-transformers>=3.0.0
-faiss-cpu>=1.8.0
-datasets>=2.18.0
+rapidfuzz>=3.0.0
+
+# Optional: For advanced NLP (Layer 2 deduplication)
+# Uncomment if you want to enable sentence embedding-based deduplication
+# sentence-transformers>=3.0.0
+# faiss-cpu>=1.8.0
 
 # Phan he API Backend (Application Layer)
 fastapi==0.110.0
