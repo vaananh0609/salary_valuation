@@ -7,6 +7,21 @@
 __pycache__/
 *.pyc
 
+# Virtual environments
+venv/
+.venv/
+env/
+
 # Local tooling
 .vscode/
 .idea/
+
+# Runtime outputs
+logs/
+*.log
+
+# Generated data zones (keep static references committed)
+data/raw/
+data/staging/
+data/processed/
+data/exports/

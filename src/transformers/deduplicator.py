@@ -1,164 +1,172 @@
 import sys
 from pathlib import Path
 
-# Add project root to sys.path for direct script execution
+# Add project root to sys.path
 project_root = Path(__file__).parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 import pandas as pd
-import numpy as np
 import re
 import unicodedata
 from datetime import datetime, timedelta
 from pymongo import UpdateOne
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import faiss
-from datasets import load_dataset
+from rapidfuzz import process, fuzz
 import logging
 
-from src.config.db_settings import get_mongo_client, get_raw_collection
+try:
+    from sentence_transformers import SentenceTransformer
+    from sklearn.metrics.pairwise import cosine_similarity
+    LAYER2_AVAILABLE = True
+except ImportError:
+    LAYER2_AVAILABLE = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning("SentenceTransformer not available, Layer 2 will be skipped")
 
+from src.config.db_settings import get_mongo_client, get_raw_collection
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-
-# Sentence embedding model
-embedding_model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-
-# ===============================
-# Load and build FAISS index for company normalization
-# ===============================
-
-def load_company_dataset():
-    """Load Vietnamese company dataset from HuggingFace"""
-    try:
-        logger.info("Loading company dataset from HuggingFace...")
-        dataset = load_dataset(
-            "ThunderDrag/Vietnam-Stock-Symbols-and-Metadata",
-            split="train"
-        )
-        df = dataset.to_pandas()
-        companies = df["name"].dropna().unique().tolist()
-        logger.info(f"Loaded {len(companies)} companies from HuggingFace")
-        return companies
-    except Exception as e:
-        logger.warning(f"Cannot load company dataset: {e}. Using fallback.")
-        return []
+# Dynamic canonical companies list (built during processing)
+canonical_companies = []
+company_dict = {}
 
 
-company_list = load_company_dataset()
+# ========================================
+# TEXT NORMALIZATION & COMPANY NORMALIZATION
+# ========================================
 
-# Build FAISS index if company list is available
-company_embeddings = None
-faiss_index = None
-
-if company_list:
-    try:
-        logger.info("Building FAISS index for company embeddings...")
-        company_embeddings = embedding_model.encode(
-            company_list,
-            normalize_embeddings=True,
-            show_progress_bar=False
-        )
-        dim = company_embeddings.shape[1]
-        faiss_index = faiss.IndexFlatIP(dim)
-        faiss_index.add(company_embeddings.astype(np.float32))
-        logger.info(f"FAISS index built successfully with {len(company_list)} companies")
-    except Exception as e:
-        logger.warning(f"Error building FAISS index: {e}")
-        company_list = []
-        faiss_index = None
-
-
-def preprocess_text(text):
-    """Preprocess text: lowercase, remove special chars"""
+def remove_accents(text):
+    """Remove accents from unicode text (e.g., Việt Nam → Viet Nam)"""
     if not isinstance(text, str):
         return ""
-    text = str(text).lower().strip()
-    # Keep Unicode letters/numbers, remove special chars
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return text
+
+
+def preprocess_text(text: str) -> str:
+    """Simple text preprocessing for title and location: lowercase + remove special chars"""
+    if not isinstance(text, str):
+        return ""
+    text = text.lower().strip()
+    text = remove_accents(text)
     text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 
-def normalize_company_name(company: str) -> str:
+def normalize_text(text: str) -> str:
     """
-    Normalize company name using FAISS + embedding.
-    Maps raw company names to standardized names via nearest neighbor search.
+    Comprehensive text normalization: lowercase + remove accents + clean company prefixes.
+    Used for company name normalization.
     """
-    if pd.isna(company) or not isinstance(company, str):
+    if not isinstance(text, str):
         return ""
-
-    company_clean = preprocess_text(company)
-
-    # Fallback if FAISS index is not available
-    if not faiss_index or not company_list:
-        return company_clean
-
-    try:
-        emb = embedding_model.encode(
-            [company_clean],
-            normalize_embeddings=True,
-            show_progress_bar=False
-        )
-        
-        scores, indices = faiss_index.search(emb.astype(np.float32), 1)
-        
-        best_score = scores[0][0]
-        best_idx = indices[0][0]
-        
-        threshold = 0.85
-        if best_score >= threshold:
-            return preprocess_text(company_list[best_idx])
     
-    except Exception as e:
-        logger.debug(f"Error normalizing company '{company}': {e}")
+    # Lowercase
+    text = text.lower()
     
-    return company_clean
+    # Remove accents
+    text = remove_accents(text)
+    
+    # Remove special characters, keep only alphanumeric and spaces
+    text = re.sub(r"[^\w\s]", " ", text)
+    
+    # Remove common company legal form prefixes
+    prefixes = [
+        "cong ty", "tnhh", "co phan", "tap doan",
+        "company", "corp", "corporation",
+        "ltd", "llc", "inc", "group", "jsc",
+        "co", "lld", "vn"
+    ]
+    
+    for prefix in prefixes:
+        text = re.sub(r'\b' + prefix + r'\b', '', text)
+    
+    # Clean up multiple spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    
+    return text
 
 
-def is_time_overlap(start1, end1, start2, end2) -> bool:
-    """Kiểm tra giao thoa thời gian"""
-
-    if pd.isna(start1) or pd.isna(end1) or pd.isna(start2) or pd.isna(end2):
-        return False
-
-    return (start1 <= end2) and (start2 <= end1)
+def normalize_company(company: str) -> str:
+    """
+    Normalize company name using fuzzy matching with RapidFuzz.
+    Returns canonical form. Builds canonical list dynamically during processing.
+    
+    Example:
+        "Công ty TNHH Samsung Electronics Việt Nam" → "samsung electronics vietnam"
+        "Samsung Electronics Vietnam" → "samsung electronics vietnam"
+    """
+    global canonical_companies, company_dict
+    
+    if not isinstance(company, str) or not company.strip():
+        return ""
+    
+    clean = normalize_text(company)
+    
+    if not clean:
+        return ""
+    
+    # Check if already in company_dict (fast lookup)
+    if clean in company_dict:
+        return company_dict[clean]
+    
+    # First company
+    if not canonical_companies:
+        canonical_companies.append(clean)
+        company_dict[clean] = clean
+        return clean
+    
+    # Fuzzy match with existing canonical companies
+    match, score, idx = process.extractOne(
+        clean,
+        canonical_companies,
+        scorer=fuzz.token_sort_ratio
+    )
+    
+    # Threshold 90 = very similar companies
+    if score >= 90:
+        company_dict[clean] = match
+        return match
+    else:
+        # New canonical form found
+        canonical_companies.append(clean)
+        company_dict[clean] = clean
+        return clean
 
 
 def normalize_url(url: str) -> str:
-    """Normalize URL by removing query params"""
-    if pd.isna(url) or not isinstance(url, str):
+    """Normalize URL: remove query params"""
+    if not isinstance(url, str):
         return ""
     return url.split("?")[0].rstrip("/").lower()
 
 
-def extract_abbreviation(company: str) -> str:
-    """Extract abbreviation from company name"""
-    if not isinstance(company, str):
-        return ""
-    company_clean = preprocess_text(company)
-    words = company_clean.split()
-    if len(words) == 1:
-        return words[0][:10]
-    stop_words = {"co", "ltd", "inc", "corp", "jsc", "llc", "ng", "ty", "ph", "n"}
-    main_words = [w for w in words if w not in stop_words and len(w) > 2]
-    if main_words:
-        abbrev = ''.join(w[0] for w in main_words[:5])
-        return abbrev
-    return company_clean[:5]
+def is_time_overlap(start1, end1, start2, end2) -> bool:
+    """Check time overlap between two job posting periods"""
+    if pd.isna(start1) or pd.isna(end1) or pd.isna(start2) or pd.isna(end2):
+        return False
+    return (start1 <= end2) and (start2 <= end1)
 
 
 def run_deduplication(days_lookback: int = 14) -> list:
+    """
+    Main deduplication pipeline:
+    1. Absolute dedup: exact title+company+location+time
+    2. Relative dedup: semantic similarity with Sentence Transformers
+    """
+    logger.info("=" * 80)
+    logger.info("Starting deduplication pipeline (Sentence Embedding + Company Normalization)")
+    logger.info("=" * 80)
 
     client = get_mongo_client()
     raw_collection = get_raw_collection(client)
 
+    # Incremental query
     cutoff_date = datetime.utcnow() - timedelta(days=days_lookback)
-
     query = {
         "$or": [
             {"last_seen_at": {"$gte": cutoff_date}},
@@ -170,200 +178,176 @@ def run_deduplication(days_lookback: int = 14) -> list:
     df = pd.DataFrame(list(cursor))
 
     if df.empty:
-        logger.warning("Không có dữ liệu mới.")
+        logger.warning("No new data to process.")
         client.close()
         return []
 
     initial_count = len(df)
+    logger.info(f"Loaded {initial_count} records")
 
-    logger.info(f"Nạp {initial_count} bản ghi.")
+    # Fill missing values
+    df.fillna("", inplace=True)
 
-    df["title"] = df.get("title", "").fillna("")
-    df["company"] = df.get("company", "").fillna("")
-    df["location_text"] = df.get("location_text", "").fillna("")
-    df["link"] = df.get("link", "").apply(normalize_url)
+    # Normalize timestamp
+    df['first_crawled_at'] = pd.to_datetime(df['first_crawled_at'], errors='coerce')
+    df['last_seen_at'] = pd.to_datetime(df['last_seen_at'], errors='coerce')
 
-    # Loại duplicate URL
-    df.drop_duplicates(subset=["link"], keep="first", inplace=True)
+    # Normalize link
+    df['link'] = df.get('link', '').apply(normalize_url)
+    df.drop_duplicates(subset=['link'], keep='first', inplace=True)
+    logger.info(f"After URL dedup: {len(df)}")
 
-    logger.info(f"Sau lọc URL: {len(df)}")
+    # Text normalization
+    df['clean_title'] = df['title'].apply(preprocess_text)
+    df['clean_company'] = df['company'].apply(normalize_company)
+    df['clean_location'] = df['location_text'].apply(preprocess_text)
 
-    df["first_crawled_at"] = pd.to_datetime(df["first_crawled_at"], errors="coerce")
-    df["last_seen_at"] = pd.to_datetime(df["last_seen_at"], errors="coerce")
-
-    df["clean_title"] = df["title"].apply(preprocess_text)
-    df["clean_company"] = df["company"].apply(normalize_company_name)
-    df["clean_location"] = df["location_text"].apply(preprocess_text)
-    df["company_abbrev"] = df["clean_company"].apply(extract_abbreviation)
-
-    # ---------------------------
-    # LỚP 1: KHỬ TRÙNG LẶP TUYỆT ĐỐI
-    # ---------------------------
-
+    # ===================================
+    # LAYER 1: ABSOLUTE DEDUPLICATION
+    # ===================================
+    logger.info("\n[Layer 1] Absolute deduplication (title+company+location)...")
+    
     df.sort_values(
-        by=["clean_title", "clean_company", "clean_location", "last_seen_at"],
+        by=['clean_title', 'clean_company', 'clean_location', 'last_seen_at'],
         ascending=[True, True, True, False],
-        inplace=True,
+        inplace=True
     )
-
     df.reset_index(drop=True, inplace=True)
 
     to_drop_absolute = set()
-
-    grouped_absolute = df.groupby(
-        ["clean_title", "clean_company", "clean_location"]
-    )
-
-    for _, group in grouped_absolute:
-
+    for _, group in df.groupby(['clean_title', 'clean_company', 'clean_location']):
         if len(group) <= 1:
             continue
-
         indices = group.index.tolist()
-
         for i in range(len(indices)):
-
             idx1 = indices[i]
-
             if idx1 in to_drop_absolute:
                 continue
-
             for j in range(i + 1, len(indices)):
-
                 idx2 = indices[j]
-
                 if is_time_overlap(
-                    df.at[idx1, "first_crawled_at"],
-                    df.at[idx1, "last_seen_at"],
-                    df.at[idx2, "first_crawled_at"],
-                    df.at[idx2, "last_seen_at"],
+                    df.at[idx1, 'first_crawled_at'], df.at[idx1, 'last_seen_at'],
+                    df.at[idx2, 'first_crawled_at'], df.at[idx2, 'last_seen_at']
                 ):
                     to_drop_absolute.add(idx2)
 
     df.drop(index=list(to_drop_absolute), inplace=True)
     df.reset_index(drop=True, inplace=True)
+    logger.info(f"After layer 1: {len(df)}")
 
-    logger.info(f"Sau lớp lọc tuyệt đối: {len(df)}")
-
-    # ---------------------------
-    # LỚP 2: KHỬ TRÙNG LẶP TƯƠNG ĐỐI
-    # ---------------------------
-
-    df["feature_string"] = df["clean_title"] + " " + df["clean_company"]
-
-    df["_block_key"] = df.apply(
-        lambda r: f"{r['clean_company']}||{r['clean_location']}||{r['clean_title'][:20]}"
-        if r["clean_company"]
-        else f"__anon__||{r['clean_location']}||{r['clean_title'][:20]}",
-        axis=1,
-    )
-
+    # ===================================
+    # LAYER 2: RELATIVE DEDUPLICATION
+    # ===================================
     to_drop_relative = set()
-
-    grouped_company = df.groupby("_block_key")
-
-    for block_key, group in grouped_company:
-
-        if len(group) <= 1:
-            continue
-
-        indices = group.index.tolist()
-
-        texts = df.loc[indices, "feature_string"].tolist()
+    
+    if LAYER2_AVAILABLE:
+        logger.info("\n[Layer 2] Relative dedup (Sentence Embedding + Cosine Similarity)...")
+        
+        df['feature_string'] = df['clean_title'] + " " + df['clean_company']
+        df['_block_key'] = df.apply(
+            lambda r: f"{r['clean_company']}||{r['clean_location']}" 
+            if r['clean_company'] else f"__anon__||{r['clean_location']}",
+            axis=1
+        )
 
         try:
+            vectorizer_global = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
-            embeddings = embedding_model.encode(
-                texts,
-                batch_size=32,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
+            for block_key, group in df.groupby('_block_key'):
+                if len(group) <= 1:
+                    continue
 
-            cosine_sim = cosine_similarity(embeddings)
+                indices = group.index.tolist()
+                texts = df.loc[indices, 'feature_string'].tolist()
 
+                try:
+                    embeddings = vectorizer_global.encode(
+                        texts,
+                        normalize_embeddings=True,
+                        show_progress_bar=False
+                    )
+                    cosine_sim = cosine_similarity(embeddings)
+
+                    threshold = 0.88
+                    for i in range(len(indices)):
+                        idx1 = indices[i]
+                        if idx1 in to_drop_relative:
+                            continue
+                        for j in range(i + 1, len(indices)):
+                            idx2 = indices[j]
+                            if cosine_sim[i, j] > threshold:
+                                if is_time_overlap(
+                                    df.at[idx1, 'first_crawled_at'], df.at[idx1, 'last_seen_at'],
+                                    df.at[idx2, 'first_crawled_at'], df.at[idx2, 'last_seen_at']
+                                ):
+                                    to_drop_relative.add(idx2)
+                except Exception as e:
+                    logger.warning(f"Error in block {block_key}: {e}")
+                    continue
         except Exception as e:
-
-            logger.warning(f"Lỗi embedding block {block_key}: {e}")
-
-            continue
-
-        threshold = 0.88
-
-        for i in range(len(indices)):
-
-            idx1 = indices[i]
-
-            if idx1 in to_drop_relative:
-                continue
-
-            for j in range(i + 1, len(indices)):
-
-                idx2 = indices[j]
-
-                if cosine_sim[i, j] > threshold:
-
-                    if is_time_overlap(
-                        df.at[idx1, "first_crawled_at"],
-                        df.at[idx1, "last_seen_at"],
-                        df.at[idx2, "first_crawled_at"],
-                        df.at[idx2, "last_seen_at"],
-                    ):
-                        to_drop_relative.add(idx2)
+            logger.warning(f"Layer 2 skipped: {e}")
+    else:
+        logger.info("\n[Layer 2] Skipped (SentenceTransformer not available)")
 
     df_cleaned = df.drop(index=list(to_drop_relative))
-
     final_count = len(df_cleaned)
+    
+    logger.info(f"After layer 2: {final_count}")
+    logger.info(f"Total duplicates removed: {initial_count - final_count}")
 
-    logger.info(f"Số bản ghi cuối: {final_count}")
-    logger.info(f"Đã loại {initial_count - final_count} duplicate.")
-
-    # ---------------------------
-    # LƯU STAGING
-    # ---------------------------
-
+    # ===================================
+    # SAVE TO STAGING
+    # ===================================
+    logger.info("\n[Staging] Saving to MongoDB...")
+    
     db = client[raw_collection.database.name]
-
     staging_collection = db["staging_jobs"]
 
-    columns_to_drop = [
-        "_block_key",
-        "clean_title",
-        "clean_company",
-        "clean_location",
-        "feature_string",
-    ]
-
-    staging_records = (
-        df_cleaned.drop(columns=columns_to_drop, errors="ignore")
-        .to_dict("records")
-    )
+    # Prepare records with company normalization
+    columns_to_drop = ['_block_key', 'clean_title', 'clean_company', 'clean_location', 'feature_string']
+    staging_records = []
     
-    logger.info(f"Sample staging records (first 2):")
-    for i, rec in enumerate(staging_records[:2]):
-        logger.info(f"  Record {i}: company={rec.get('company')}, company_abbrev={rec.get('company_abbrev')}")
+    for _, row in df_cleaned.iterrows():
+        record = row.drop(columns_to_drop, errors='ignore').to_dict()
+        # Add company normalization fields
+        record['company_raw'] = record.get('company', '')
+        record['company_normalized'] = row.get('clean_company', '')
+        staging_records.append(record)
 
     if staging_records:
-
         ops = [
             UpdateOne({"link": r["link"]}, {"$set": r}, upsert=True)
             for r in staging_records
         ]
-
+        
         batch_size = 1000
-
         for i in range(0, len(ops), batch_size):
+            staging_collection.bulk_write(ops[i:i+batch_size], ordered=False)
 
-            staging_collection.bulk_write(
-                ops[i : i + batch_size],
-                ordered=False,
-            )
+        # Log sample
+        logger.info(f"\nSample records (first 2):")
+        for idx, rec in enumerate(staging_records[:2]):
+            logger.info(f"  [{idx}] company_raw='{rec.get('company_raw', 'N/A')}' → company_normalized='{rec.get('company_normalized', 'N/A')}'")
+
+    # Log company dictionary for reference
+    logger.info(f"\n[Company Mapping] Built {len(company_dict)} canonical forms:")
+    for raw_form, canonical_form in sorted(company_dict.items())[:5]:
+        if raw_form != canonical_form:
+            logger.info(f"  '{raw_form}' → '{canonical_form}'")
 
     client.close()
+    logger.info("\nDeduplication complete!")
+    logger.info("=" * 80)
 
-    logger.info("Đã lưu staging thành công.")
+    return df_cleaned['link'].tolist()
 
-    return df_cleaned["link"].tolist()
+
+def deduplicate_jobs(days_lookback: int = 14) -> list:
+    """
+    Wrapper function for backward compatibility.
+    Calls run_deduplication with the specified lookback period.
+    """
+    return run_deduplication(days_lookback=days_lookback)
 
 
 if __name__ == "__main__":
