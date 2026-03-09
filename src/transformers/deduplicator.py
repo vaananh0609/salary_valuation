@@ -7,12 +7,15 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 import pandas as pd
+import numpy as np
 import re
 import unicodedata
 from datetime import datetime, timedelta
 from pymongo import UpdateOne
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+import faiss
+from datasets import load_dataset
 import logging
 
 from src.config.db_settings import get_mongo_client, get_raw_collection
@@ -23,7 +26,51 @@ logger = logging.getLogger(__name__)
 
 
 # Sentence embedding model
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+embedding_model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+# ===============================
+# Load and build FAISS index for company normalization
+# ===============================
+
+def load_company_dataset():
+    """Load Vietnamese company dataset from HuggingFace"""
+    try:
+        logger.info("Loading company dataset from HuggingFace...")
+        dataset = load_dataset(
+            "ThunderDrag/Vietnam-Stock-Symbols-and-Metadata",
+            split="train"
+        )
+        df = dataset.to_pandas()
+        companies = df["name"].dropna().unique().tolist()
+        logger.info(f"Loaded {len(companies)} companies from HuggingFace")
+        return companies
+    except Exception as e:
+        logger.warning(f"Cannot load company dataset: {e}. Using fallback.")
+        return []
+
+
+company_list = load_company_dataset()
+
+# Build FAISS index if company list is available
+company_embeddings = None
+faiss_index = None
+
+if company_list:
+    try:
+        logger.info("Building FAISS index for company embeddings...")
+        company_embeddings = embedding_model.encode(
+            company_list,
+            normalize_embeddings=True,
+            show_progress_bar=False
+        )
+        dim = company_embeddings.shape[1]
+        faiss_index = faiss.IndexFlatIP(dim)
+        faiss_index.add(company_embeddings.astype(np.float32))
+        logger.info(f"FAISS index built successfully with {len(company_list)} companies")
+    except Exception as e:
+        logger.warning(f"Error building FAISS index: {e}")
+        company_list = []
+        faiss_index = None
 
 
 def normalize_url(url) -> str:
@@ -51,20 +98,39 @@ def preprocess_text(text) -> str:
 
 
 def normalize_company_name(company: str) -> str:
-    """Chuẩn hóa tên doanh nghiệp"""
-
+    """
+    Normalize company name using FAISS + embedding.
+    Maps raw company names to standardized names via nearest neighbor search.
+    """
     if pd.isna(company) or not isinstance(company, str):
         return ""
 
-    company = company.lower()
+    company_clean = preprocess_text(company)
 
-    company = re.sub(
-        r"\b(công ty|tnhh|cp|cổ phần|tập đoàn|corp|corporation|jsc|co\.,? ltd|ltd)\b",
-        "",
-        company,
-    )
+    # Fallback if FAISS index is not available
+    if not faiss_index or not company_list:
+        return company_clean
 
-    return preprocess_text(company)
+    try:
+        emb = embedding_model.encode(
+            [company_clean],
+            normalize_embeddings=True,
+            show_progress_bar=False
+        )
+        
+        scores, indices = faiss_index.search(emb.astype(np.float32), 1)
+        
+        best_score = scores[0][0]
+        best_idx = indices[0][0]
+        
+        threshold = 0.85
+        if best_score >= threshold:
+            return preprocess_text(company_list[best_idx])
+    
+    except Exception as e:
+        logger.debug(f"Error normalizing company '{company}': {e}")
+    
+    return company_clean
 
 
 def is_time_overlap(start1, end1, start2, end2) -> bool:
