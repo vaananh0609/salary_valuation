@@ -25,3 +25,5 @@ data/raw/
 data/staging/
 data/processed/
 data/exports/
+
+*.docx
