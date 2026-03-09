@@ -73,27 +73,14 @@ if company_list:
         faiss_index = None
 
 
-def normalize_url(url) -> str:
-    """Chuẩn hóa URL"""
-    if pd.isna(url) or not isinstance(url, str):
+def preprocess_text(text):
+    """Preprocess text: lowercase, remove special chars"""
+    if not isinstance(text, str):
         return ""
-
-    url = url.split("?")[0]
-    return url.rstrip("/").lower()
-
-
-def preprocess_text(text) -> str:
-    """Chuẩn hóa text"""
-    if pd.isna(text) or not isinstance(text, str):
-        return ""
-
-    text = unicodedata.normalize("NFD", text)
-    text = text.encode("ascii", "ignore").decode("utf-8")
-    text = text.lower()
-
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-
+    text = str(text).lower().strip()
+    # Keep Unicode letters/numbers, remove special chars
+    text = re.sub(r'[^\w\s]', ' ', text, flags=re.UNICODE)
+    text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 
@@ -142,9 +129,30 @@ def is_time_overlap(start1, end1, start2, end2) -> bool:
     return (start1 <= end2) and (start2 <= end1)
 
 
-def run_deduplication(days_lookback: int = 14) -> list:
+def normalize_url(url: str) -> str:
+    """Normalize URL by removing query params"""
+    if pd.isna(url) or not isinstance(url, str):
+        return ""
+    return url.split("?")[0].rstrip("/").lower()
 
-    logger.info("Khởi động tiến trình khử trùng lặp bằng Sentence Embedding...")
+
+def extract_abbreviation(company: str) -> str:
+    """Extract abbreviation from company name"""
+    if not isinstance(company, str):
+        return ""
+    company_clean = preprocess_text(company)
+    words = company_clean.split()
+    if len(words) == 1:
+        return words[0][:10]
+    stop_words = {"co", "ltd", "inc", "corp", "jsc", "llc", "ng", "ty", "ph", "n"}
+    main_words = [w for w in words if w not in stop_words and len(w) > 2]
+    if main_words:
+        abbrev = ''.join(w[0] for w in main_words[:5])
+        return abbrev
+    return company_clean[:5]
+
+
+def run_deduplication(days_lookback: int = 14) -> list:
 
     client = get_mongo_client()
     raw_collection = get_raw_collection(client)
@@ -186,6 +194,7 @@ def run_deduplication(days_lookback: int = 14) -> list:
     df["clean_title"] = df["title"].apply(preprocess_text)
     df["clean_company"] = df["company"].apply(normalize_company_name)
     df["clean_location"] = df["location_text"].apply(preprocess_text)
+    df["company_abbrev"] = df["clean_company"].apply(extract_abbreviation)
 
     # ---------------------------
     # LỚP 1: KHỬ TRÙNG LẶP TUYỆT ĐỐI
@@ -329,6 +338,10 @@ def run_deduplication(days_lookback: int = 14) -> list:
         df_cleaned.drop(columns=columns_to_drop, errors="ignore")
         .to_dict("records")
     )
+    
+    logger.info(f"Sample staging records (first 2):")
+    for i, rec in enumerate(staging_records[:2]):
+        logger.info(f"  Record {i}: company={rec.get('company')}, company_abbrev={rec.get('company_abbrev')}")
 
     if staging_records:
 
